@@ -1,17 +1,10 @@
-# Python
+# Python bytecode
 __pycache__/
 *.pyc
 *.pyo
 
-# Virtualenv
-.venv/
-env/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# DFT/計算結果
-output/
+# 計算結果 / 出力
+*.csv
 *.npz
 *.chk
 *.cube
@@ -19,7 +12,11 @@ output/
 *.wfn
 *.wfx
 *.molden
+output/
 
 # OS
 .DS_Store
 Thumbs.db
+
+# 明示的に Python ソースは無視しない
+!**/*.py
