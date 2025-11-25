@@ -1,0 +1,23 @@
+{
+  "run_id": "20251007_221249_H2O_H2O_6-31G_RHF",
+  "method": {
+    "type": "RHF",
+    "basis": "6-31g"
+  },
+  "results": {
+    "total_energy_hartree": -83.06153047821438,
+    "n_electrons": 10,
+    "n_basis": 13,
+    "n_occ_closed_shell": 5,
+    "trace_DS": 10.000000000000004
+  },
+  "input": {
+    "file": "H2O.xyz",
+    "path": "/Users/yuma/Desktop/DFT/H2O.xyz",
+    "tag": "H2O"
+  },
+  "system": {
+    "formula": "H2O",
+    "natoms": 3
+  }
+}

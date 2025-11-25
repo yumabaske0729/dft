@@ -1,0 +1,23 @@
+{
+  "run_id": "20251115_184033_H2O_H2O_STO-3G_RHF",
+  "method": {
+    "type": "RHF",
+    "basis": "sto-3g"
+  },
+  "results": {
+    "total_energy_hartree": -72.85940127591185,
+    "n_electrons": 10,
+    "n_basis": 7,
+    "n_occ_closed_shell": 5,
+    "trace_DS": 9.999999999999996
+  },
+  "input": {
+    "file": "H2O.xyz",
+    "path": "/Users/yuma/Desktop/Gaussian/DFT/molecule/H2O.xyz",
+    "tag": "H2O"
+  },
+  "system": {
+    "formula": "H2O",
+    "natoms": 3
+  }
+}
