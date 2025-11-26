@@ -22,7 +22,7 @@ import numpy as np
 from math import pi, sqrt
 from typing import Tuple
 
-from ..gaussian_math.gaussian_math import norm_prefactor
+from ..math.gaussian_math import norm_prefactor
 from .one_electron.boys import boys_function
 
 # ---- R-DIAG のグローバル状態（回数制限・重複抑止用） ----

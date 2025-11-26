@@ -1,7 +1,6 @@
 # DFT/exporter/base.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-
 import os
 import re
 import csv
@@ -9,9 +8,7 @@ import json
 import time
 from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple, Callable, Optional
-
 import numpy as np
-
 
 @dataclass
 class ExportOptions:
@@ -19,22 +16,21 @@ class ExportOptions:
     出力ポリシー/書式の集中管理用オプション
     """
     # ディレクトリ／ファイル命名
-    base_out_dir: str = "runs"        # 例: runs/<run_id>/output
-    include_subdir: str = "output"    # 上の run_id 直下に作るサブフォルダ
+    # → 出力先を DFT/output/<run_id> に統一
+    base_out_dir: str = "DFT"
+    include_subdir: str = "output"
     timestamp_format: str = "%Y%m%d_%H%M%S"
     run_id_fmt: str = "{ts}_{input_tag}_{formula}_{basis}_{method}"  # basis は後で upper()
 
     # ファイル名フォーマット
-    energies_csv_name_fmt: str = "energies_{input_tag}.csv"   # 従来: final 行のみ
+    energies_csv_name_fmt: str = "energies_{input_tag}.csv"  # 従来: final 行のみ
     summary_json_name_fmt: str = "summary_{input_tag}.json"
     matrices_npz_name_fmt: str = "matrices_{input_tag}.npz"
-
     # 追加: 同内容の JSON も同時出力（行列の実体を JSON 化）
     matrices_json_name_fmt: str = "matrices_{input_tag}.json"
-
     # 追加（既存のまま）
-    scf_csv_name_fmt: str = "scf_{input_tag}.csv"             # 反復履歴
-    details_json_name_fmt: str = "details_{input_tag}.json"   # 詳細一式（行列はメタ情報に縮約）
+    scf_csv_name_fmt: str = "scf_{input_tag}.csv"  # 反復履歴
+    details_json_name_fmt: str = "details_{input_tag}.json"  # 詳細一式（行列はメタ情報に縮約）
 
     # 表示書式
     energy_fmt: str = "{:.12f}"
@@ -46,10 +42,8 @@ class ExportOptions:
     save_energies: bool = True
     save_scf_history: bool = True
     save_details: bool = True
-
     # 追加: NPZ に加えて JSON も出すか（デフォルト ON）
     save_matrices_json: bool = True
-
 
 class Exporter:
     """
@@ -121,7 +115,7 @@ class Exporter:
         self, *, input_tag: str, formula: str, basis: str, method: str, timestamp: Optional[str] = None
     ) -> Tuple[str, str]:
         """
-        run_id と保存先 outdir (= <base_out_dir>/<run_id>/<include_subdir>) を返す
+        run_id と保存先 outdir (= DFT/output/<run_id>) を返す
         """
         ts = timestamp or time.strftime(self.opt.timestamp_format)
         run_id = self.opt.run_id_fmt.format(
@@ -131,7 +125,8 @@ class Exporter:
             basis=basis.upper(),
             method=method,
         )
-        outdir = os.path.join(self.opt.base_out_dir, run_id, self.opt.include_subdir)
+        # DFT/output/<run_id> に統一
+        outdir = os.path.join(self.opt.base_out_dir, self.opt.include_subdir, run_id)
         return run_id, outdir
 
     # ---- 低レベル書き出し ----
@@ -231,32 +226,28 @@ class Exporter:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(blob, f, ensure_ascii=False)
 
-    # ----- details を JSON 化できる形にサニタイズ -----
+    # ---- details を JSON 化できる形にサニタイズ ----
     @staticmethod
     def _jsonify(obj: Any) -> Any:
         """
         numpy のスカラー/配列を JSON 化可能な形に変換する再帰関数。
         - np.generic スカラー: Python スカラーへ
-        - np.ndarray      : メタ情報 dict（実体は書かない）
+        - np.ndarray : メタ情報 dict（実体は書かない）
         - dict/list/tuple : 再帰的に処理
         それ以外はそのまま返す。
         """
         # numpy scalar -> python scalar
         if isinstance(obj, np.generic):
             return obj.item()
-
         # numpy array -> meta only
         if isinstance(obj, np.ndarray):
             return {"__ndarray__": True, "shape": list(obj.shape), "dtype": str(obj.dtype)}
-
         # dict
         if isinstance(obj, dict):
             return {k: Exporter._jsonify(v) for k, v in obj.items()}
-
         # list / tuple
         if isinstance(obj, (list, tuple)):
             return [Exporter._jsonify(v) for v in obj]
-
         return obj
 
     def _details_sanitized(self, details: Dict[str, Any]) -> Dict[str, Any]:
@@ -266,7 +257,6 @@ class Exporter:
         """
         if not isinstance(details, dict):
             return details
-
         out = dict(details)
         mats = out.get("matrices", None)
         if isinstance(mats, dict):
@@ -278,7 +268,6 @@ class Exporter:
                     a = np.asarray(v)
                     meta_only[k] = {"__ndarray__": True, "shape": list(a.shape), "dtype": str(a.dtype)}
             out["matrices"] = meta_only
-
         # 残りを再帰的に numpy -> python へ
         out = self._jsonify(out)
         return out
@@ -307,7 +296,6 @@ class Exporter:
         symbols = [a.symbol for a in mol.atoms]
         formula = self.hill_formula(symbols)
         input_tag = self.safe_tag_from_path(input_path)
-
         run_id, outdir = self.make_run_id_and_outdir(
             input_tag=input_tag, formula=formula, basis=basis, method=method, timestamp=timestamp
         )
@@ -333,10 +321,12 @@ class Exporter:
                 "tag": input_tag,
             },
         }
+
         # details からダイジェストをサマリへ反映
         if details:
             comps = details.get("components", {})
             diags = details.get("diagnostics", {})
+            grid_info = details.get("grid_info", {})
             if comps:
                 summary_extra.setdefault("results", {}).update(
                     {k: float(v) for k, v in comps.items() if isinstance(v, (int, float, np.generic))}
@@ -344,6 +334,9 @@ class Exporter:
             if diags:
                 # numpy スカラーを素の型に
                 summary_extra["diagnostics"] = self._jsonify(diags)
+            if grid_info:
+                # grid_info（lebedev_degree と lebedev_order 併記）も summary に載せる
+                summary_extra["grid_info"] = self._jsonify(grid_info)
 
         # 各ファイルのパス
         energies_csv = os.path.join(outdir, self.opt.energies_csv_name_fmt.format(input_tag=input_tag))
@@ -380,7 +373,6 @@ class Exporter:
         )
         if self.opt.save_matrices:
             self._write_matrices_npz(matrices_npz, **_arrays)
-
         # NPZ と同じ内容を JSON にも保存
         if self.opt.save_matrices and self.opt.save_matrices_json:
             self._write_matrices_json(matrices_json, **_arrays)

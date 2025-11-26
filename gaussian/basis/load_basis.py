@@ -1,12 +1,5 @@
+# DFT/basis/load_basis.py  — gbs専用ローダ（JSON関連コードは撤去）
 # -*- coding: utf-8 -*-
-"""
-DFT/basis/load_basis.py
-Gaussian形式（.gbs/.bas/.txt）専用の基底関数ローダ。
-- JSON読み込みは完全削除
-- SP殻対応（SとPに分割）
-- D記法→E記法変換
-"""
-
 import os
 from typing import Dict, Any, List
 
@@ -14,9 +7,12 @@ from typing import Dict, Any, List
 _GAUSS_EXTS = {".gbs", ".bas", ".gaussian", ".txt"}
 
 class BasisLoader:
+    """
+    Gaussian形式（.gbs/.bas/.txt）専用の基底関数ローダ。
+    指定ディレクトリ内の基底関数セットを自動検出して管理します。
+    """
     def __init__(self, basis_dir: str | None = None):
-        if basis_dir is None:
-            basis_dir = os.path.dirname(os.path.abspath(__file__))
+        basis_dir = basis_dir or os.path.dirname(os.path.abspath(__file__))
         if not os.path.isdir(basis_dir):
             raise NotADirectoryError(f"basis_dir is not a directory: {basis_dir}")
         self.basis_dir = basis_dir
@@ -45,9 +41,17 @@ class BasisLoader:
 
 
 def _parse_gaussian_basis_file(path: str) -> Dict[str, Any]:
+    """
+    Gaussian形式のテキスト基底をパース。
+    - SP殻は SとPの殻へ分割して格納
+    - D記法→E記法変換
+    出力形式:
+      { "H": {"shells": [ { "angular_momentum":[0], "exponents":[...], "coefficients":[[...]] }, ... ] }, ... }
+    """
     with open(path, "r", encoding="utf-8") as f:
         raw_lines = f.readlines()
 
+    # コメントと空行を除去、D記法→E記法
     lines: List[str] = []
     for ln in raw_lines:
         s = ln.strip()
@@ -55,7 +59,9 @@ def _parse_gaussian_basis_file(path: str) -> Dict[str, Any]:
             continue
         lines.append(s.replace("D", "E").replace("d", "e"))
 
+    # 角運動量の文字→整数マップ
     lmap = {"S": 0, "P": 1, "D": 2, "F": 3, "G": 4}
+
     data: Dict[str, Any] = {}
     i = 0
     cur_sym: str | None = None
@@ -64,14 +70,17 @@ def _parse_gaussian_basis_file(path: str) -> Dict[str, Any]:
         if sym not in data:
             data[sym] = {"shells": []}
 
+    # 本体パース
     while i < len(lines):
         toks = lines[i].split()
         i += 1
         if not toks:
             continue
+        # 区切り
         if toks[0] == "****":
             cur_sym = None
             continue
+        # 元素開始（"H 0" など）
         if len(toks) >= 2 and toks[1] == "0":
             cur_sym = toks[0]
             ensure_elem(cur_sym)
@@ -81,6 +90,7 @@ def _parse_gaussian_basis_file(path: str) -> Dict[str, Any]:
             continue
 
         shell_type = toks[0].upper()
+        # --- SP 共有殻 ---
         if shell_type == "SP":
             nprim = int(toks[1])
             s_scale = 1.0
@@ -102,11 +112,13 @@ def _parse_gaussian_basis_file(path: str) -> Dict[str, Any]:
                 p_exps.append(exp * p_scale)
                 p_coefs.append(cP)
 
+            # S殻として追加
             data[cur_sym]["shells"].append({
                 "angular_momentum": [lmap["S"]],
                 "exponents": s_exps,
                 "coefficients": [s_coefs],
             })
+            # P殻として追加
             data[cur_sym]["shells"].append({
                 "angular_momentum": [lmap["P"]],
                 "exponents": p_exps,
@@ -114,14 +126,17 @@ def _parse_gaussian_basis_file(path: str) -> Dict[str, Any]:
             })
             continue
 
+        # --- 通常殻（S/P/D/…） ---
         if shell_type not in lmap:
+            # 未知行はスキップ
             continue
+
         nprim = int(toks[1])
         scale = 1.0
         if len(toks) >= 3:
             try:
                 scale = float(toks[2])
-            except:
+            except Exception:
                 scale = 1.0
 
         exps, coefs = [], []

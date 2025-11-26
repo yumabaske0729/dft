@@ -142,8 +142,8 @@ def assign_basis_functions(molecule, basis_name: str) -> List[ContractedGTO]:
                 )
 
     # === 3) 収縮GTOの厳密規格化（⟨χ|χ⟩=1 に強制）========================
-    for g in basis_functions:
-        scale = contracted_norm(g)  # = 1 / sqrt(<g|g>)
-        g.coefficients = [c * scale for c in g.coefficients]
+    #for g in basis_functions:
+        #scale = contracted_norm(g)  # = 1 / sqrt(<g|g>)
+        #g.coefficients = [c * scale for c in g.coefficients]
 
     return basis_functions

@@ -32,7 +32,6 @@ from .gga import (
     LDC_LYP,
 )
 
-
 class B3LYP:
     """
     B3LYP-lite hybrid XC（RKS）

@@ -1,27 +1,32 @@
 # DFT/main.py
+# DFT/main.py
 # -*- coding: utf-8 -*-
-import argparse
-import sys
 import os
+import json
+import time
+import re
 import numpy as np
-from .input.parser import parse_xyz
-from .basis.assign_basis import assign_basis_functions
-from .scf.rhf import run_rhf
-from .scf.dft import run_dft
-from .utils.constants import get_atomic_number
-from .exporter import Exporter, ExportOptions
+from typing import Optional, Dict, Any
 
-# 公式 one-electron ビルダ（S/T/V）を優先
+from DFT.input.parser import parse_xyz
+from DFT.basis.assign_basis import assign_basis_functions
+from DFT.scf.rhf import run_rhf, compute_nuclear_repulsion
+from DFT.scf.dft import run_dft
+from DFT.utils.constants import get_atomic_number
+from DFT.exporter.base import Exporter, ExportOptions
+
+# --- one-electron integrals (with safe fallback) ---
 try:
-    from .integrals.one_electron import (
+    from DFT.integrals.one_electron import (
         build_overlap_matrix,
         build_kinetic_matrix,
         build_nuclear_matrix,
-    )  # noqa: F401
+    )
     print("[one-electron] Using OFFICIAL builders (S/T/V).")
 except Exception as e:
-    print(f"[one-electron] Fallback in use (T=V=0). Reason: {e}", file=sys.stderr)
-    from .integrals.one_electron.overlap import contracted_overlap
+    print(f"[one-electron] Fallback in use (T=V=0). Reason: {e}")
+    from DFT.integrals.one_electron.overlap import contracted_overlap
+
     def build_overlap_matrix(basis):
         n = len(basis)
         S = np.zeros((n, n))
@@ -30,144 +35,237 @@ except Exception as e:
                 val = contracted_overlap(bi, bj)
                 S[i, j] = S[j, i] = val
         return S
+
     def build_kinetic_matrix(basis):
-        n = len(basis)
-        return np.zeros((n, n))
+        return np.zeros((len(basis), len(basis)))
+
     def build_nuclear_matrix(basis, atoms):
-        n = len(basis)
-        return np.zeros((n, n))
+        return np.zeros((len(basis), len(basis)))
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Gaussian-like quantum chemistry calculation (RHF/DFT)"
-    )
-    parser.add_argument("-i", "--input", required=True, help="Input structure file (XYZ format)")
-    parser.add_argument("-b", "--basis", default="sto-3g", help="Basis set name (e.g., sto-3g, 6-31g)")
-    parser.add_argument("-c", "--charge", type=int, default=0, help="Total molecular charge")
-    parser.add_argument("-m", "--multiplicity", type=int, default=1, help="Spin multiplicity")
-    parser.add_argument("--method", choices=["RHF", "DFT"], default="RHF", help="Method: RHF or DFT")
 
-    # ERI spot check
-    parser.add_argument(
-        "--debug-eri",
-        action="store_true",
-        help="Print selected AO ERIs ((11|11),(11|12),(11|22),(12|12)) for the first two AOs",
-    )
-    # DFT grid level
-    parser.add_argument(
-        "--grid-level",
-        type=int,
-        default=3,
-        help="DFT integration grid level (controls radial points). Example: 5 or 8",
-    )
-    # ★ 追加: XCストリーミング制御
-    parser.add_argument(
-        "--xc-chunk-size",
-        type=int,
-        default=None,
-        help="Chunk size for streaming XC integration (set 0 or omit to disable).",
-    )
-    parser.add_argument(
-        "--xc-d-thresh",
-        type=float,
-        default=0.0,
-        help="Density matrix screening threshold |D_mn| < tau ignored (default 0.0).",
-    )
-    parser.add_argument(
-        "--xc-validate",
-        type=int,
-        default=1,
-        help="1: validate streaming vs vectorized and fallback if mismatch; 0: no validation.",
-    )
+# --- helpers (tags/run_id) ---
+def _hill_formula(symbols):
+    from collections import Counter
+    cnt = Counter(symbols)
+    if "C" in cnt:
+        order = ["C"] + (["H"] if "H" in cnt else []) + [k for k in sorted(cnt) if k not in ("C", "H")]
+    else:
+        order = sorted(cnt)
+    parts = []
+    for k in order:
+        n = cnt[k]
+        parts.append(k if n == 1 else f"{k}{n}")
+    return "".join(parts)
 
-    args = parser.parse_args()
 
-    # --- 入力ファイル探索処理を追加 ---
-    input_path = args.input
-    if not os.path.isfile(input_path):
-        # カレントにファイルがなければ DFT/molecule/ 下を探す
-        candidate = os.path.join("DFT", "molecule", os.path.basename(args.input))
-        if os.path.isfile(candidate):
-            input_path = candidate
-            print(f"[info] Input file found in DFT/molecule/: {input_path}")
-        else:
-            print(f"Error: Input file '{args.input}' not found in current directory or DFT/molecule/", file=sys.stderr)
-            sys.exit(1)
+def _safe_tag_from_path(path_str: str, maxlen: int = 64) -> str:
+    base = os.path.basename(path_str)
+    stem = os.path.splitext(base)[0]
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", stem)
+    s = re.sub(r"^[._-]+", "", s)
+    s = re.sub(r"[._-]+$", "", s)
+    return (s or "input")[:maxlen]
 
-    # Load molecule
+
+def _timestamp(fmt: str = "%Y%m%d_%H%M%S") -> str:
+    return time.strftime(fmt)
+
+
+# --- JK safe rebuild (tries candidates and picks non-J one) ---
+def _jk_rebuild_safe(basis_funcs, D: np.ndarray):
+    """
+    Build ERI, J and a 'safe' K:
+    J = einsum('rs,mnrs->mn', D, eri)
+    K candidates:
+    STD : eri_perm = eri ; einsum('rs,mrns->mn', D, eri_perm)
+    ALT1: eri_perm = eri.transpose(0,3,2,1); einsum('rs,msrn->mn', D, eri_perm)
+    ALT2: eri_perm = eri.transpose(0,1,3,2); einsum('rs,mnsr->mn', D, eri_perm)
+    Choose the candidate with the largest ||J-K||_F and hermitize.
+    """
+    from DFT.integrals.two_electron import build_eri_tensor
+    eri = build_eri_tensor(basis_funcs)  # [ERI] ... (mnrs)
+    J = np.einsum('rs,mnrs->mn', D, eri, optimize=True)
+    K_std = np.einsum('rs,mrns->mn', D, eri, optimize=True)
+    K_alt1 = np.einsum('rs,msrn->mn', D, eri.transpose(0, 3, 2, 1), optimize=True)
+    K_alt2 = np.einsum('rs,mnsr->mn', D, eri.transpose(0, 1, 3, 2), optimize=True)
+    cands = {"STD": K_std, "ALT1": K_alt1, "ALT2": K_alt2}
+    diffs = {name: float(np.linalg.norm(J - K)) for name, K in cands.items()}
+    best_name = max(diffs, key=diffs.get)
+    K_best = cands[best_name]
+    J = 0.5 * (J + J.T)
+    K_best = 0.5 * (K_best + K_best.T)
+    print(f"[jk.safe] picked {best_name}, ||J-K||_F={diffs[best_name]:.3e}")
+    return J, K_best
+
+
+# --- ensure E_nuc is present in details JSON (robust to both layouts) ---
+def _inject_E_nuc_to_details(details_path: str, E_nuc_val: float) -> None:
+    """
+    details.json の構造が
+    A) フラット（トップレベルに各フィールド）
+    B) ネスト（{"details": {"components": {...}}}）
+    のいずれでも、E_nuc を必ず書き込みます（上書き可）。
+    """
     try:
-        mol = parse_xyz(input_path, charge=args.charge, multiplicity=args.multiplicity)
+        with open(details_path, "r", encoding="utf-8") as f:
+            blob = json.load(f)
     except Exception as e:
-        print(f"Error reading input file: {e}", file=sys.stderr)
-        sys.exit(1)
+        print(f"[export] E_nuc patch skipped (read failed): {e}")
+        return
 
-    # Assign basis
-    basis_funcs = assign_basis_functions(mol, args.basis)
+    patched = False
+    # パターンA: トップレベルに入れる
+    if blob.get("E_nuc") in (None, 0.0):
+        blob["E_nuc"] = float(E_nuc_val)
+        patched = True
+    # パターンB: ネストにも可能なら入れる
+    details_obj = blob.setdefault("details", {})
+    comps_obj = details_obj.setdefault("components", {})
+    if comps_obj.get("E_nuc") in (None, 0.0):
+        comps_obj["E_nuc"] = float(E_nuc_val)
+        patched = True
+
+    if patched:
+        try:
+            with open(details_path, "w", encoding="utf-8") as f:
+                json.dump(blob, f, ensure_ascii=False, indent=2)
+            print(f"[export] Patched details JSON with E_nuc={E_nuc_val:.12f} Ha -> {details_path}")
+        except Exception as e:
+            print(f"[export] E_nuc patch skipped (write failed): {e}")
+
+
+def run_calculation(
+    input_path: str,
+    basis: str = "sto-3g",
+    method: str = "RHF",
+    grid_level: int = 3,
+    xc_chunk_size: Optional[int] = None,
+    xc_d_thresh: float = 0.0,
+    xc_validate: bool = True,
+    charge: int = 0,
+    multiplicity: int = 1,
+    debug_eri: bool = False,
+) -> Dict[str, Any]:
+    """
+    RHF または DFT 計算を実行し、成果物を Exporter で
+    DFT/output/<run_id>/ に一元出力します（summary は Exporter に一本化）。
+    """
+    # --- parse & basis assign ---
+    mol = parse_xyz(input_path, charge=charge, multiplicity=multiplicity)
+    basis_funcs = assign_basis_functions(mol, basis)
     print(f"Assigned {len(basis_funcs)} basis functions.")
 
-    # -- ERI probe (optional)
-    if args.debug_eri and len(basis_funcs) >= 2:
-        try:
-            from .integrals.two_electron import contracted_eri
-            b0, b1 = basis_funcs[0], basis_funcs[1]
-            eri_1111 = contracted_eri(b0, b0, b0, b0)
-            eri_1112 = contracted_eri(b0, b0, b0, b1)
-            eri_1122 = contracted_eri(b0, b0, b1, b1)
-            eri_1212 = contracted_eri(b0, b1, b0, b1)
-            print(
-                "[ERI-probe] "
-                f"(11|11)={eri_1111:.12f}, (11|12)={eri_1112:.12f}, "
-                f"(11|22)={eri_1122:.12f}, (12|12)={eri_1212:.12f}"
-            )
-        except Exception as _e:
-            print(f"[ERI-probe] failed: {_e}", file=sys.stderr)
-
-    # One-electron matrices
+    # --- one-electron matrices ---
     S = build_overlap_matrix(basis_funcs)
     T = build_kinetic_matrix(basis_funcs)
     V = build_nuclear_matrix(basis_funcs, mol.atoms)
+    print("[diagnose]")
+    print(f"S||_F={np.linalg.norm(S):.6e}, T||_F={np.linalg.norm(T):.6e}, V||_F={np.linalg.norm(V):.6e}")
 
-    import numpy as _np
-    print(
-        f"[diagnose]\n"
-        f"S||_F={_np.linalg.norm(S):.6e},\n"
-        f"T||_F={_np.linalg.norm(T):.6e},\n"
-        f"V||_F={_np.linalg.norm(V):.6e}"
-    )
-
-    # Run SCF
-    if args.method == "RHF":
+    # --- SCF ---
+    method_up = method.upper()
+    if method_up == "RHF":
         E_scf, C, eps, details = run_rhf(S, T, V, basis_funcs, mol)
         print(f"Final RHF Energy: {E_scf:.8f} Hartree")
-    else:
-        # DFT: ストリーミング設定を run_dft に渡す
-        xc_chunk = None if (args.xc_chunk_size is None or args.xc_chunk_size == 0) else int(args.xc_chunk_size)
-        xc_vldt  = bool(int(args.xc_validate))
+    elif method_up == "DFT":
+        xc_chunk = None if (xc_chunk_size is None or xc_chunk_size == 0) else int(xc_chunk_size)
         E_scf, C, eps, details = run_dft(
             S, T, V, basis_funcs, mol,
-            grid_level=args.grid_level,
+            grid_level=grid_level,
             xc_chunk_size=xc_chunk,
-            xc_d_thresh=float(args.xc_d_thresh),
-            xc_validate=xc_vldt,
+            xc_d_thresh=float(xc_d_thresh),
+            xc_validate=xc_validate,
         )
         print(f"Final DFT(B3LYP-lite) Energy: {E_scf:.8f} Hartree")
+    else:
+        raise ValueError(f"Unknown method: {method}")
 
-    # Export（出力先：DFT/output/）
-    exporter = Exporter(
-        ExportOptions(
-            base_out_dir=os.path.join("DFT", "output"),
-            include_subdir="",
-        )
+    # --- run_id & out_dir ---
+    symbols = [a.symbol for a in mol.atoms]
+    formula = _hill_formula(symbols)
+    input_tag = _safe_tag_from_path(input_path)
+    ts = _timestamp("%Y%m%d_%H%M%S")
+    run_id = f"{ts}_{input_tag}_{formula}_{basis.upper()}_{method_up}"
+    out_dir = os.path.join("DFT", "output", run_id)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # --- Exporter init（summary を Exporter に一本化） ---
+    opt = ExportOptions(
+        save_matrices=True,
+        save_matrices_json=True,
+        save_summary=True,
+        save_energies=False,       # ← main 側は CSV energies を書かない
+        save_scf_history=False,    # ← main 側は SCF CSV を書かない
+        base_out_dir="DFT",
+        include_subdir="output"
     )
+    exporter = Exporter(opt)
+
+    # --- spin-summed density & H_core ---
+    n_electrons = sum(get_atomic_number(a.symbol) for a in mol.atoms) - int(charge)
+    n_occ = int(n_electrons // 2)
+    D_final = np.zeros_like(S, dtype=np.float64)
+    for m in range(n_occ):
+        v = C[:, m]
+        D_final += 2.0 * np.outer(v, v)
+    H_core = T + V
+
+    # --- take J/K/F/Vxc from details if present; otherwise rebuild ---
+    mats_details = details.get("matrices", {}) if isinstance(details, dict) else {}
+    J_final = mats_details.get("J_final")
+    K_final = mats_details.get("K_final")
+    F_final = mats_details.get("F_final")
+    Vxc_final = mats_details.get("Vxc_final")
+
+    need_rebuild = (J_final is None) or (K_final is None)
+    if (not need_rebuild):
+        sep = float(np.linalg.norm(J_final - K_final))
+        if sep < 1e-10 and np.linalg.norm(J_final) > 1e-10:
+            print(f"[jk.guard] J≈K detected (||J-K||={sep:.3e}); rebuilding K safely.")
+            need_rebuild = True
+    if need_rebuild:
+        try:
+            J_final, K_final = _jk_rebuild_safe(basis_funcs, D_final)
+        except Exception as e:
+            print(f"[jk.safe] rebuild failed: {e}")
+
+    # RHF の場合のみ、F を整合的に再構成（DFT は run_dft 側が F/Vxc を管理）
+    if F_final is None and method_up == "RHF" and (J_final is not None) and (K_final is not None):
+        F_final = H_core + J_final - 0.5 * K_final
+        F_final = 0.5 * (F_final + F_final.T)
+
+    # --- assemble matrices to save ---
+    matrices = {
+        "S": S, "T": T, "V": V,
+        "H_core": H_core, "D_final": D_final,
+        "C": C, "eps": eps, "E_scf": E_scf,
+    }
+    if J_final is not None: matrices["J_final"] = J_final
+    if K_final is not None: matrices["K_final"] = K_final
+    if F_final is not None: matrices["F_final"] = F_final
+    if Vxc_final is not None: matrices["Vxc_final"] = Vxc_final
+    # details.matrices の残りも併合
+    for k, v in mats_details.items():
+        if k not in matrices and v is not None:
+            matrices[k] = v
+
+    # --- Export via Exporter（run_id の timestamp を main 側 ts に合わせる） ---
     exporter.export_final(
-        input_path=input_path,
-        method=args.method,
-        basis=args.basis,
-        mol=mol,
+        input_path=input_path, method=method_up, basis=basis, mol=mol,
         S=S, T=T, V=V, C=C, eps=eps, E_scf=E_scf,
         get_atomic_number=get_atomic_number,
         details=details,
+        timestamp=ts,  # ← 重要：Exporter 側 run_id と完全一致
     )
 
-if __name__ == "__main__":
-    main()
+    # --- ensure E_nuc in details（details JSON 側は保険でパッチ） ---
+    try:
+        E_nuc_val = compute_nuclear_repulsion(mol.atoms)
+    except Exception:
+        E_nuc_val = 0.0
+
+    details_path = os.path.join(out_dir, f"details_{input_tag}.json")
+    _inject_E_nuc_to_details(details_path, float(E_nuc_val))
+
+    print("[export] artifacts root:", out_dir)
+    return {"energy": E_scf, "coeff": C, "eps": eps, "details": details}

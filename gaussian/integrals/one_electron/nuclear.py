@@ -10,9 +10,10 @@ References:
 - Fermann & Valeev review (arXiv:2007.12057).
 """
 from __future__ import annotations
+import os
 import numpy as np
 from math import pi
-from ...gaussian_math.gaussian_math import norm_prefactor
+from ...math.gaussian_math import norm_prefactor
 from .boys import boys_function  # robust small/large t
 
 # ---- s–s primitives: fast kernel (positive), final (-Z) outside ----
@@ -105,6 +106,11 @@ def _primitive_nuclear_general(l1, m1, n1, a1, A,
 
 # ---- contracted level ----
 def contracted_nuclear(gto1, gto2, atoms, get_atomic_number) -> float:
+    """
+    One-electron nuclear attraction integral over contracted Cartesian GTOs.
+    s–s は専用高速カーネル、一般 l は Hermite 展開＋Boys関数。
+    末尾で環境変数 VNE_SCALE_TEST を適用（デフォルト 1.0）。
+    """
     V = 0.0
     is_ss = (gto1.l + gto1.m + gto1.n == 0) and (gto2.l + gto2.m + gto2.n == 0)
 
@@ -126,4 +132,13 @@ def contracted_nuclear(gto1, gto2, atoms, get_atomic_number) -> float:
                         gto2.l, gto2.m, gto2.n, a2, gto2.center,
                         atom.position, Z
                     )
+
+    # --- テスト用スケール（VNE_SCALE_TEST） ---
+    # 例: VNE_SCALE_TEST=1.053 なら V を 5.3% 強める
+    try:
+        scale = float(os.getenv("VNE_SCALE", "1.0"))
+    except Exception:
+        scale = 1.0
+    V *= scale
+
     return float(V)

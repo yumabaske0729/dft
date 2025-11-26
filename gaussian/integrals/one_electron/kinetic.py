@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 import numpy as np
 from math import sqrt, pi
-from ...gaussian_math.gaussian_math import norm_prefactor
+from ...math.gaussian_math import norm_prefactor
 
 def _os_1d_overlap_table(i_max: int, j_max: int, Ax: float, Bx: float, alpha: float, beta: float):
     """

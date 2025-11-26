@@ -1,6 +1,6 @@
 # DFT/integrals/one_electron/overlap.py  ← 全文置換
 import numpy as np
-from ...gaussian_math.gaussian_math import norm_prefactor
+from ...math.gaussian_math import norm_prefactor
 from .kinetic import _os_1d_overlap_table
 
 def primitive_overlap(l1, m1, n1, alpha1, A, l2, m2, n2, alpha2, B):

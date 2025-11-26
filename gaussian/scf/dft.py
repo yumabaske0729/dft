@@ -7,7 +7,7 @@ import time
 import numpy as np
 from scipy.linalg import eigh
 from .diis import diis_extrapolate
-from .jk import form_jk_matrices  # ← 修正：.rhf ではなく .jk から import
+from .jk import form_jk_matrices   # JK builder（物理指標選択版）
 from .rhf import compute_nuclear_repulsion, run_rhf
 from .grid import generate_integration_grid
 from .functional import B3LYP
@@ -52,15 +52,8 @@ def run_dft(
     xc_d_thresh: float = 0.0,
     xc_validate: int = 1,
 ):
-    """
-    Restricted KS-DFT (hybrid: B3LYP-lite).
-
-    Notes
-    -----
-    - Fock: F = H + J - a0 * K + Vxc (HF exchange mixing a0 handled here)
-    - Energy (electron): E_elec = Tr[D H] + 0.5 Tr[D (J - a0 K)] + Exc
-    """
-    # --- env overrides ---
+    """Restricted KS-DFT (hybrid: B3LYP-lite)."""
+    # env overrides
     gl = _get_int_env("DFT_GRID_LEVEL", None)
     if gl and gl > 0:
         grid_level = gl
@@ -101,7 +94,7 @@ def run_dft(
     inv_sqrt = np.where(evalS > thresh, evalS ** -0.5, 0.0)
     S_half = U @ np.diag(inv_sqrt) @ U.T
     min_pos = float(np.min(evalS[evalS > thresh])) if np.any(evalS > thresh) else np.inf
-    max_ev = float(np.max(evalS)) if evalS.size else np.inf
+    max_ev  = float(np.max(evalS)) if evalS.size else np.inf
     S_cond_est = (max_ev / min_pos) if np.isfinite(min_pos) and (min_pos > 0) else np.inf
 
     # ERI & grid
@@ -143,8 +136,8 @@ def run_dft(
     # SCF loop
     # ============================
     for iteration in range(1, max_iter + 1):
-        # JK at current D
-        J, K = form_jk_matrices(eri, D)
+        # JK at current D  — α = a0（DFT）
+        J, K = form_jk_matrices(eri, D, H_core=H_core, a0=a0)
 
         # XC at current D
         b3 = B3LYP(grid, basis_functions, D, chunk_size=chunk_sz, d_thresh=d_thresh, validate_streaming=vldt)
@@ -181,8 +174,8 @@ def run_dft(
         D_new = density_from_C(C)
 
         # --- energy with D_new (consistent accounting) ---
-        Jn, Kn = form_jk_matrices(eri, D_new)
-        # ---- DFT-side diagnostics & guard ----
+        Jn, Kn = form_jk_matrices(eri, D_new, H_core=H_core, a0=a0)
+
         EJ_sum, EK_sum, R_KJ = _jk_energy_sums(D_new, Jn, Kn)
         print(f"[dft] ΣD·J={EJ_sum:.12f}, ΣD·K={EK_sum:.12f}, R_KJ={R_KJ:.6f}")
         if os.getenv("DFT_JK_GUARD", "1") != "0":
@@ -194,32 +187,26 @@ def run_dft(
             if a0_env is not None: b3_energy.a0 = float(a0_env)
             if aX_env is not None: b3_energy.aX = float(aX_env)
             if aC_env is not None: b3_energy.aC = float(aC_env)
+
         Exc_new, _Vxc_dummy = b3_energy.evaluate_exchange_correlation()
 
-        E_one = float(np.einsum('mn,mn->', D_new, H_core))
-        E_jk  = float(0.5 * np.einsum('mn,mn->', D_new, (Jn - a0 * Kn)))
+        E_one = float(np.einsum('mn,mn->', D_new, H_core))        
+        E_jk = float(0.5 * np.einsum('mn,mn->', D_new, Jn) - 0.25 * a0 * np.einsum('mn,mn->', D_new, Kn))        
         E_elec = E_one + E_jk + float(Exc_new)
-        E_nuc = compute_nuclear_repulsion(mol.atoms)
+        E_nuc  = compute_nuclear_repulsion(mol.atoms)
         E_total = E_elec + E_nuc
-        dE = np.inf if E_old is None else abs(E_total - E_old)
+
+        dE   = np.inf if E_old is None else abs(E_total - E_old)
         rmsD = float(np.sqrt(np.mean((D_new - D) ** 2)))
         TrDS = float(np.einsum('mn,mn->', D_new, S))
+
         print(f"DFT Iter {iteration}: E = {E_total:.12f} Ha, ΔE = {dE:.2e}")
 
         scf_hist.append({
-            "iter": iteration,
-            "E_total": E_total,
-            "dE": dE if np.isfinite(dE) else "",
-            "RMS_D": rmsD,
-            "TrDS": TrDS,
-            "E_Hcore": E_one,
-            "E_JK": E_jk,
-            "Exc": float(Exc_new),  # recorded at D_new
-            "err_norm": err_norm,
-            # JK diagnostics
-            "sum_DJ": EJ_sum,
-            "sum_DK": EK_sum,
-            "R_KJ": R_KJ,
+            "iter": iteration, "E_total": E_total, "dE": dE if np.isfinite(dE) else "",
+            "RMS_D": rmsD, "TrDS": TrDS, "E_Hcore": E_one, "E_JK": E_jk,
+            "Exc": float(Exc_new), "err_norm": err_norm,
+            "sum_DJ": EJ_sum, "sum_DK": EK_sum, "R_KJ": R_KJ,
             "converged": (dE < conv_thresh),
         })
 
@@ -227,7 +214,7 @@ def run_dft(
             print(f"DFT SCF converged in {iteration} cycles. Final Energy = {E_total:.12f} Ha")
             # finalize on D_new
             D = D_new
-            # Vxc_final for report consistency
+            # Vxc_final for report consistency（収束時も D_new）
             b3_final = B3LYP(grid, basis_functions, D, chunk_size=chunk_sz, d_thresh=d_thresh, validate_streaming=vldt)
             if override_xc:
                 if a0_env is not None: b3_final.a0 = float(a0_env)
@@ -237,11 +224,16 @@ def run_dft(
             F_final = H_core + Jn - a0 * Kn + Vxc_final
             break
 
-        # next cycle
+        # 非収束でも最新密度で
         D, E_old = D_new, E_total
-        # keep latest (pre-converged) composites for details
-        F_final = H_core + Jn - a0 * Kn + Vxc
-        Vxc_final = Vxc
+        b3_last = B3LYP(grid, basis_functions, D_new, chunk_size=chunk_sz, d_thresh=d_thresh, validate_streaming=vldt)
+        if override_xc:
+            if a0_env is not None: b3_last.a0 = float(a0_env)
+            if aX_env is not None: b3_last.aX = float(aX_env)
+            if aC_env is not None: b3_last.aC = float(aC_env)
+        _Exc_last, Vxc_last = b3_last.evaluate_exchange_correlation()
+        F_final = H_core + Jn - a0 * Kn + Vxc_last
+        Vxc_final = Vxc_last
     else:
         print(f"Warning: DFT SCF did not converge in {max_iter} iterations; final ΔE = {dE:.2e}")
 
@@ -249,14 +241,15 @@ def run_dft(
     mo_energies = [float(x) for x in np.asarray(eps, dtype=float).tolist()]
     mo_occ = [2.0 if i < nocc else 0.0 for i in range(nbf)]
 
+    # --- diagnostics へ vne_scale を記録（記録パッチ） ---
+    vne_scale = float(os.getenv("VNE_SCALE", "1.0"))
+
     details = {
         "components": {
             "E_Hcore": float(np.einsum('mn,mn->', D, H_core)),
             "E_JK": float(0.5 * np.einsum('mn,mn->', D, (Jn - a0 * Kn))),
             "Exc": float(Exc_new),
-            "E_elec": float(np.einsum('mn,mn->', D, H_core)
-                            + 0.5 * np.einsum('mn,mn->', D, (Jn - a0 * Kn))
-                            + float(Exc_new)),
+            "E_elec": float(np.einsum('mn,mn->', D, H_core)) + float(0.5 * np.einsum('mn,mn->', D, (Jn - a0 * Kn))) + float(Exc_new),
             "E_nuc": float(E_nuc),
             "E_total": float(E_total),
             "E_RHF_warmstart": float(E_rhf),
@@ -271,19 +264,14 @@ def run_dft(
             "S_norm_F": float(np.linalg.norm(S)),
             "T_norm_F": float(np.linalg.norm(T)),
             "V_norm_F": float(np.linalg.norm(V)),
-            # JK diagnostics to persist:
-            "sum_DJ": EJ_sum,
-            "sum_DK": EK_sum,
-            "R_KJ": R_KJ,
+            "sum_DJ": EJ_sum, "sum_DK": EK_sum, "R_KJ": R_KJ,
+            "vne_scale": vne_scale,                  # ← ★ 追加
         },
-        "counts": {
-            "n_basis": int(nbf),
-            "n_electrons": int(n_electrons),
-            "n_occ_closed_shell": int(nocc),
-        },
+        "counts": { "n_basis": int(nbf), "n_electrons": int(n_electrons), "n_occ_closed_shell": int(nocc) },
         "grid_info": {
             "level": int(grid_level),
-            "lebedev_order": int(grid.meta.get("lebedev_order", 6)),
+            "lebedev_degree": int(grid.meta.get("lebedev_degree", grid.meta.get("lebedev_order", 6))),
+            "lebedev_order": int(grid.meta.get("lebedev_order", 0)),
             "n_radial": int(grid.meta.get("n_radial", 0)),
             "Rmax": float(grid.meta.get("Rmax", 0.0)),
             "n_points": int(n_points),
@@ -292,12 +280,8 @@ def run_dft(
         "xc_params": {"a0": float(b3.a0), "aX": float(b3.aX), "aC": float(b3.aC)},
         "scf_history": scf_hist,
         "matrices": {
-            "F_final": F_final,
-            "J_final": Jn,
-            "K_final": Kn,
-            "Vxc_final": Vxc_final,
-            "S_half": S_half,
-            "S_evals": evalS,
+            "F_final": F_final, "J_final": Jn, "K_final": Kn,
+            "Vxc_final": Vxc_final, "S_half": S_half, "S_evals": evalS,
         },
         "mo": {"energies_hartree": mo_energies, "occupations": mo_occ},
     }
